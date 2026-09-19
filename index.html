@@ -53,6 +53,11 @@ button{background:none;border:0;padding:0;cursor:pointer}
 .spacer{flex:1}
 .icon-btn{width:38px;height:38px;border-radius:999px;border:1px solid var(--line);background:var(--card);
   display:grid;place-items:center;color:var(--muted)}
+.icon-btn{position:relative}
+.dot{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:99px;background:var(--muted);opacity:.45}
+.dot.on{background:var(--accent);opacity:1}
+.dot.busy{background:var(--accent);opacity:.55}
+.dot.err{background:var(--danger);opacity:1}
 .icon-btn svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 
 .screen{flex:1;min-height:0;display:none;flex-direction:column}
@@ -168,6 +173,10 @@ button{background:none;border:0;padding:0;cursor:pointer}
     <button class="icon-btn" id="btnHistory" aria-label="Saved entries">
       <svg viewBox="0 0 24 24"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>
     </button>
+    <button class="icon-btn" id="btnSync" aria-label="Sync across devices">
+      <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 0-14-5M4 12a8 8 0 0 0 14 5"/><path d="M6 3v4H2M18 21v-4h4"/></svg>
+      <span class="dot" id="syncDot"></span>
+    </button>
     <button class="icon-btn" id="btnData" aria-label="Backup and restore">
       <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v3h16v-3"/></svg>
     </button>
@@ -268,6 +277,18 @@ button{background:none;border:0;padding:0;cursor:pointer}
   <div class="linkrow"><button class="linkbtn" id="dClose">Close</button><button class="linkbtn danger" id="dWipe">Erase everything</button></div>
 </div>
 
+<div class="sheet" id="sheetSync" role="dialog" aria-modal="true" aria-labelledby="sheetSyncTitle">
+  <h2 id="sheetSyncTitle">Sync across devices</h2>
+  <p class="logsub" id="syncStatus" style="margin:-8px 0 16px">Not connected.</p>
+  <label class="field"><span>Sync key</span><input type="text" id="syncKey" autocomplete="off" spellcheck="false"></label>
+  <p class="logsub" style="margin:-8px 0 16px">Enter the same key on every device of yours. Anyone without it uses the app normally, stored only in their own browser.</p>
+  <div class="actions">
+    <button class="btn-quiet" id="syncOff">Disconnect</button>
+    <button class="btn-primary" id="syncOn">Connect</button>
+  </div>
+  <div class="linkrow"><button class="linkbtn" id="syncClose">Close</button><button class="linkbtn" id="syncNow">Sync now</button></div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -279,14 +300,14 @@ var DEEP    = ["#E4705C","#E09A2E","#9BAF45","#4FA06B","#2E9E93","#3F7FC8","#7C6
 var DEFAULT_COLOR = PASTELS[4];
 var KEY = "tallyCounter.v1";
 
-var state = { mode:"tap", tap:{ label:"", value:0 }, counters:[], log:[] };
+var state = { mode:"tap", tap:{ label:"", value:0 }, counters:[], log:[], updatedAt:0 };
 
 function load(){
   try{
     var raw = localStorage.getItem(KEY);
     if (!raw) return;
     var d = JSON.parse(raw);
-    if (d && typeof d === "object") adopt(d);
+    if (d && typeof d === "object"){ adopt(d); state.updatedAt = Number(d.updatedAt) || 0; }
   }catch(e){}
   try{ var m = localStorage.getItem(KEY + ".mode"); if (m) state.mode = m; }catch(e){}
 }
@@ -303,11 +324,13 @@ function adopt(d){
   });
 }
 var saveTimer;
-function persist(){
+function persist(fromRemote){
+  if (!fromRemote){ state.updatedAt = Date.now(); schedulePush(); }
   clearTimeout(saveTimer);
   saveTimer = setTimeout(function(){
     try{
-      localStorage.setItem(KEY, JSON.stringify({ tap:state.tap, counters:state.counters, log:state.log }));
+      localStorage.setItem(KEY, JSON.stringify({ tap:state.tap, counters:state.counters,
+        log:state.log, updatedAt: state.updatedAt }));
     }catch(e){ toast("Could not save. Browser storage is blocked or full."); }
   }, 250);
 }
@@ -602,9 +625,96 @@ $("dFile").addEventListener("change", function(e){
 $("dWipe").addEventListener("click", function(){
   if (!window.confirm("Erase all counters and saved entries on this device?")) return;
   state.tap = { label:"", value:0 }; state.counters = []; state.log = [];
-  try{ localStorage.removeItem(KEY); }catch(e){}
+  persist();
   renderTap(); renderCounters(); renderLog(); closeSheet(); toast("Erased");
 });
+
+/* ---------- sync ---------- */
+var SKEY = KEY + ".synckey";
+var sync = { key:"", lastPull:0 };
+try{ sync.key = localStorage.getItem(SKEY) || ""; }catch(e){}
+
+function setSyncUI(cls, msg){
+  var d = $("syncDot");
+  d.className = "dot" + (cls ? " " + cls : "");
+  $("syncStatus").textContent = msg;
+}
+function schedulePush(){
+  if (!sync.key) return;
+  clearTimeout(sync.timer);
+  sync.timer = setTimeout(function(){ push(); }, 1500);
+}
+function pull(quiet){
+  if (!sync.key) return Promise.resolve();
+  setSyncUI("busy", "Checking\u2026");
+  return fetch("/api/state", { headers:{ "x-sync-key": sync.key }, cache:"no-store" })
+    .then(function(r){
+      if (r.status === 401){ setSyncUI("err", "That key was rejected."); return null; }
+      if (!r.ok) throw new Error("http " + r.status);
+      return r.json();
+    })
+    .then(function(j){
+      if (!j) return;
+      var remoteAt = Number(j.updatedAt) || 0;
+      if (j.data && remoteAt > (state.updatedAt || 0)){
+        adopt(j.data);
+        state.updatedAt = remoteAt;
+        persist(true);
+        renderTap(); renderCounters(); renderLog();
+        setSyncUI("on", "Up to date \u2014 pulled from your other device.");
+        if (!quiet) toast("Pulled the newer version");
+      } else if (remoteAt < (state.updatedAt || 0)){
+        return push(quiet);
+      } else {
+        setSyncUI("on", "Up to date.");
+      }
+    })
+    .catch(function(){ setSyncUI("err", "Could not reach the server. Changes stay on this device."); });
+}
+function push(quiet){
+  if (!sync.key) return Promise.resolve();
+  setSyncUI("busy", "Saving\u2026");
+  return fetch("/api/state", {
+    method:"PUT",
+    headers:{ "content-type":"application/json", "x-sync-key": sync.key },
+    body: JSON.stringify({ updatedAt: state.updatedAt || Date.now(),
+      data:{ tap:state.tap, counters:state.counters, log:state.log } })
+  }).then(function(r){
+    if (r.status === 401){ setSyncUI("err", "That key was rejected."); return; }
+    if (!r.ok) throw new Error("http " + r.status);
+    setSyncUI("on", "Up to date.");
+    if (!quiet) toast("Synced");
+  }).catch(function(){ setSyncUI("err", "Offline. It will sync next time you open the app."); });
+}
+$("btnSync").addEventListener("click", function(){
+  $("syncKey").value = sync.key;
+  if (!sync.key) setSyncUI("", "Not connected. Counts stay in this browser.");
+  openSheet($("sheetSync"));
+});
+$("syncOn").addEventListener("click", function(){
+  var k = $("syncKey").value.trim();
+  if (!k){ setSyncUI("err", "Enter your key first."); return; }
+  sync.key = k;
+  try{ localStorage.setItem(SKEY, k); }catch(e){}
+  pull();
+});
+$("syncOff").addEventListener("click", function(){
+  sync.key = "";
+  try{ localStorage.removeItem(SKEY); }catch(e){}
+  $("syncKey").value = "";
+  setSyncUI("", "Disconnected. Counts stay in this browser.");
+});
+$("syncNow").addEventListener("click", function(){ sync.lastPull = Date.now(); pull(); });
+$("syncClose").addEventListener("click", closeSheet);
+
+function refreshFromServer(){
+  if (!sync.key || document.hidden) return;
+  if (Date.now() - sync.lastPull < 5000) return;
+  sync.lastPull = Date.now();
+  pull(true);
+}
+window.addEventListener("focus", refreshFromServer);
+document.addEventListener("visibilitychange", refreshFromServer);
 
 /* ---------- wiring ---------- */
 $("mTap").addEventListener("click", function(){ setMode("tap"); });
@@ -643,13 +753,9 @@ setMode(state.mode);
 renderTap();
 renderCounters();
 renderLog();
+if (sync.key){ sync.lastPull = Date.now(); pull(true); }
+else setSyncUI("", "Not connected. Counts stay in this browser.");
 })();
 </script>
-
-<!-- Cloudflare Web Analytics. Replace PASTE_YOUR_TOKEN_HERE with the token from
-     your Cloudflare dashboard. No cookies, no identifiers, aggregate counts only.
-     The app works normally whether or not this loads. -->
-<script defer src="https://static.cloudflareinsights.com/beacon.min.js"
-        data-cf-beacon='{"token": "PASTE_YOUR_TOKEN_HERE"}'></script>
 </body>
 </html>
